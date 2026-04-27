@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+tiny-imagenet-200.zip
+data/
