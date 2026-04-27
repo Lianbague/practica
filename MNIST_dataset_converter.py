@@ -2,6 +2,7 @@ import numpy as np
 import h5py
 import tensorflow as tf
 import random
+import matplotlib.pyplot as plt
 
 class MNISTDataset:
     def __init__(self, X, Y):
@@ -10,7 +11,6 @@ class MNISTDataset:
 
     def normalize(self):
         self.X = self.X / 255.0
-
 
 
 class DatasetConverter:
@@ -41,9 +41,6 @@ class DatasetConverter:
                 writer.write(example.SerializeToString())
         print(f"Saved TFRecord to {path}")
 
-import numpy as np
-import random
-import matplotlib.pyplot as plt
 
 class DatasetValidator:
 
@@ -52,7 +49,6 @@ class DatasetValidator:
         assert len(ds1.X) == len(ds2.X), "❌ Different dataset sizes!"
         print("✔ Same number of samples")
 
-        # --- LABEL CHECK ---
         label_mismatches = np.sum(ds1.Y != ds2.Y)
         if label_mismatches == 0:
             print("✔ Labels are IDENTICAL")
@@ -60,7 +56,6 @@ class DatasetValidator:
             print(f"❌ Label mismatches: {label_mismatches}")
 
         indices = random.sample(range(len(ds1.X)), num_samples)
-
         differences = []
 
         for idx in indices:

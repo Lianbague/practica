@@ -1,11 +1,8 @@
 import os
 import numpy as np
-import matplotlib.pyplot as plt
+import h5py
+import tensorflow as tf
 from PIL import Image
-
-from MNIST_dataset_converter import DatasetValidator
-from MNIST_dataset_converter import MNISTDataset
-from MNIST_dataset_converter import DatasetConverter
 
 
 def load_from_imagefolder(root_path):
@@ -22,16 +19,12 @@ def load_from_imagefolder(root_path):
         folder_path = os.path.join(root_path, str(label))
         if not os.path.exists(folder_path):
             continue
-            
+
         for filename in os.listdir(folder_path):
             if filename.lower().endswith((".png", ".jpg", ".jpeg")):
                 img_path = os.path.join(folder_path, filename)
                 try:
-                    # Open, convert to grayscale, and ensure 28x28 size
-                    img = Image.open(img_path).convert('L')
-                    img = img.resize((28, 28))
-                    
-                    # Flatten to 784 pixels and append
+                    img = Image.open(img_path).convert('L').resize((28, 28))
                     images.append(np.array(img).flatten())
                     labels.append(label)
                 except Exception as e:
@@ -40,36 +33,26 @@ def load_from_imagefolder(root_path):
     return np.array(images), np.array(labels)
 
 def load_from_hdf5(file_path):
-    import h5py
     with h5py.File(file_path, 'r') as f:
         X = f['X'][:]
         Y = f['Y'][:]
     return X, Y
 
 def load_from_tfrecord(file_path):
-    import tensorflow as tf
-    raw_dataset = tf.data.TFRecordDataset(file_path)
-    
-    # Define a parsing function (this depends on how you saved the TFRecord)
-    def _parse_function(proto):
-        # Define your feature description here based on how you saved the data
-        feature_description = {
-            'image': tf.io.FixedLenFeature([], tf.string),
-            'label': tf.io.FixedLenFeature([], tf.int64),
-        }
-        parsed_features = tf.io.parse_single_example(proto, feature_description)
-        image = tf.io.decode_raw(parsed_features['image'], tf.uint8)
-        label = parsed_features['label']
-        return image, label
-    
-    parsed_dataset = raw_dataset.map(_parse_function)
-    
-    images = []
-    labels = []
-    for image, label in parsed_dataset:
+    feature_description = {
+        'image': tf.io.FixedLenFeature([], tf.string),
+        'label': tf.io.FixedLenFeature([], tf.int64),
+    }
+
+    def _parse(proto):
+        parsed = tf.io.parse_single_example(proto, feature_description)
+        image = tf.io.decode_raw(parsed['image'], tf.uint8)
+        return image, parsed['label']
+
+    images, labels = [], []
+    for image, label in tf.data.TFRecordDataset(file_path).map(_parse):
         images.append(image.numpy())
         labels.append(label.numpy())
-    
     return np.array(images), np.array(labels)
 
 def load_from_npz(file_path):
@@ -147,40 +130,33 @@ def gradient_descent(X, Y, iterations, alpha):
     return w1, b1, w2, b2
 
 
-
 # ------------- Neural Network Class -------------
+
+_LOADERS = {
+    "imagefolder": load_from_imagefolder,
+    "hdf5":        load_from_hdf5,
+    "npz":         load_from_npz,
+    "tfrecord":    load_from_tfrecord,
+}
 
 class NeuralNetworkMNIST:
     def __init__(self, train_dir, test_dir, format="imagefolder"):
         self.format = format
         self.train_dir = train_dir
         self.test_dir = test_dir
-        self.w1, self.b1, self.w2, self.b2 = None, None, None, None # Parameters will be initialized during training
-    
+        self.w1 = self.b1 = self.w2 = self.b2 = None
+
     def load_data(self):
-        if self.format == "imagefolder":
-            self.X_train_raw, self.Y_train_raw = load_from_imagefolder(self.train_dir)
-            self.X_test_raw, self.Y_test_raw = load_from_imagefolder(self.test_dir)
-        elif self.format == "hdf5":
-            self.X_train_raw, self.Y_train_raw = load_from_hdf5(self.train_dir)
-            self.X_test_raw, self.Y_test_raw = load_from_hdf5(self.test_dir)
-        elif self.format == "tfrecord":
-            self.X_train_raw, self.Y_train_raw = load_from_tfrecord(self.train_dir)
-            self.X_test_raw, self.Y_test_raw = load_from_tfrecord(self.test_dir)
-        elif self.format == "npz":
-            self.X_train_raw, self.Y_train_raw = load_from_npz(self.train_dir)
-            self.X_test_raw, self.Y_test_raw = load_from_npz(self.test_dir)
-        else:
+        loader = _LOADERS.get(self.format)
+        if loader is None:
             raise ValueError(f"Unsupported format: {self.format}")
-        
-    
+        self.X_train_raw, self.Y_train_raw = loader(self.train_dir)
+        self.X_test_raw, self.Y_test_raw = loader(self.test_dir)
+
     def preprocess_data(self):
-        # Shuffle training data
         shuffler = np.random.permutation(len(self.X_train_raw))
         self.X_train_raw = self.X_train_raw[shuffler]
         self.Y_train_raw = self.Y_train_raw[shuffler]
-
-        # Transpose and normalize: (784, m)
         self.X_train = self.X_train_raw.T / 255.
         self.Y_train = self.Y_train_raw
 
@@ -205,6 +181,3 @@ if __name__ == "__main__":
     nn_mnist.preprocess_data()
     nn_mnist.train(iterations=500, alpha=0.1)
     nn_mnist.evaluate_on_test_set()
-
-
-
