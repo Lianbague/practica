@@ -36,6 +36,3 @@ def visualize_tiny_imagenet_results(model, dataset, num_samples=25):
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
-
-# Usage in your main block:
-# visualize_tiny_imagenet_results(model, val_dataset, num_samples=20)

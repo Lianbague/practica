@@ -4,7 +4,6 @@ from MNIST_dataset_converter import DatasetValidator, MNISTDataset, DatasetConve
 from MNIST_visualize_results import visualize_test_predictions
 
 
-# Import your existing loaders + NN class
 from MNIST_neural_network_training import (
     load_from_imagefolder,
     load_from_hdf5,
@@ -60,7 +59,7 @@ for name, (loader, path) in formats.items():
         train_dataset,
         ds_conv,
         num_samples=10,
-        visualize=True  # 🔥 change to True if you want plots
+        visualize=True
     )
 
 # -------------------------------

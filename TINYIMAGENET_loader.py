@@ -1,6 +1,8 @@
 import os
-from PIL import Image
 import numpy as np
+import h5py
+import tensorflow as tf
+from PIL import Image
 
 
 def load_tinyimagenet_subset(root, split="train", max_classes=5):
@@ -56,14 +58,6 @@ def load_tinyimagenet_subset(root, split="train", max_classes=5):
 
     return np.array(X), np.array(Y)
 
-
-import h5py
-import numpy as np
-import tensorflow as tf
-
-# -------------------------------
-# LOADERS
-# -------------------------------
 
 def load_from_hdf5(path):
     with h5py.File(path, 'r') as f:
