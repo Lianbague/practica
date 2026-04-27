@@ -1,0 +1,10 @@
+tfg_environment/
+tiny-imagenet-200/
+mnist_imagefolder/
+*.h5
+*.npz
+*.tfrecord
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
