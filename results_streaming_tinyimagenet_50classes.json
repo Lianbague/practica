@@ -1,0 +1,230 @@
+[
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 42,
+    "timestamp": "2026-05-13T17:58:42",
+    "results": {
+      "imagefolder": {
+        "convert_s": 0.0,
+        "first_batch_s": 0.024147987365722656,
+        "ram_mb": 30.283899307250977,
+        "file_mb": 376.6015167236328,
+        "train_s": 269.37364506721497,
+        "samples_s": 928.1941195251251,
+        "accuracy": 0.7702400088310242
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 43,
+    "timestamp": "2026-05-13T18:17:06",
+    "results": {
+      "imagefolder": {
+        "convert_s": 0.0,
+        "first_batch_s": 0.017549991607666016,
+        "ram_mb": 21.406713485717773,
+        "file_mb": 376.6015167236328,
+        "train_s": 286.70170497894287,
+        "samples_s": 872.0519985277865,
+        "accuracy": 0.737280011177063
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 44,
+    "timestamp": "2026-05-13T18:36:05",
+    "results": {
+      "imagefolder": {
+        "convert_s": 0.0,
+        "first_batch_s": 0.022796630859375,
+        "ram_mb": 22.8885498046875,
+        "file_mb": 376.6015167236328,
+        "train_s": 292.2360019683838,
+        "samples_s": 855.5719721261363,
+        "accuracy": 0.7291600108146667
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 42,
+    "timestamp": "2026-05-13T18:52:25",
+    "results": {
+      "hdf5": {
+        "convert_s": 0.1443469524383545,
+        "first_batch_s": 0.016043901443481445,
+        "ram_mb": 15.699760437011719,
+        "file_mb": 586.1399536132812,
+        "train_s": 289.2183837890625,
+        "samples_s": 864.4469020715741,
+        "accuracy": 0.7509599924087524
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 43,
+    "timestamp": "2026-05-13T19:10:27",
+    "results": {
+      "hdf5": {
+        "convert_s": 0.14586210250854492,
+        "first_batch_s": 0.012653112411499023,
+        "ram_mb": 15.696784973144531,
+        "file_mb": 586.1399536132812,
+        "train_s": 285.5553951263428,
+        "samples_s": 875.5335108350008,
+        "accuracy": 0.6645200252532959
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 44,
+    "timestamp": "2026-05-13T19:24:02",
+    "results": {
+      "hdf5": {
+        "convert_s": 0.13807201385498047,
+        "first_batch_s": 0.014028072357177734,
+        "ram_mb": 15.699860572814941,
+        "file_mb": 586.1399536132812,
+        "train_s": 286.70974493026733,
+        "samples_s": 872.034590983033,
+        "accuracy": 0.7123600244522095
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 42,
+    "timestamp": "2026-05-13T19:53:03",
+    "results": {
+      "npz": {
+        "convert_s": 0.4164159297943115,
+        "first_batch_s": 0.11393618583679199,
+        "ram_mb": 1754.9957551956177,
+        "file_mb": 586.13108253479,
+        "train_s": 1043.6750569343567,
+        "samples_s": 239.58100575860163,
+        "accuracy": 0.7702400088310242
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 43,
+    "timestamp": "2026-05-13T20:23:27",
+    "results": {
+      "npz": {
+        "convert_s": 0.45136570930480957,
+        "first_batch_s": 0.11362886428833008,
+        "ram_mb": 1756.5021114349365,
+        "file_mb": 586.13108253479,
+        "train_s": 1077.4675650596619,
+        "samples_s": 232.08116718386108,
+        "accuracy": 0.737280011177063
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 44,
+    "timestamp": "2026-05-14T10:50:42",
+    "results": {
+      "npz": {
+        "convert_s": 0.43364810943603516,
+        "first_batch_s": 0.12460803985595703,
+        "ram_mb": 1752.0002965927124,
+        "file_mb": 586.13108253479,
+        "train_s": 1215.1850159168243,
+        "samples_s": 242.93222639110067,
+        "accuracy": 0.7291600108146667
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 42,
+    "timestamp": "2026-05-14T11:45:14",
+    "results": {
+      "tfrecord": {
+        "convert_s": 0.6869781017303467,
+        "first_batch_s": 0.33992981910705566,
+        "ram_mb": 4.541199684143066,
+        "file_mb": 590.9933376312256,
+        "train_s": 231.55982303619385,
+        "samples_s": 1080.2143820792965,
+        "accuracy": 0.740119993686676
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 43,
+    "timestamp": "2026-05-14T15:36:15",
+    "results": {
+      "tfrecord": {
+        "convert_s": 0.6906137466430664,
+        "first_batch_s": 0.33948302268981934,
+        "ram_mb": 4.544641494750977,
+        "file_mb": 590.9933376312256,
+        "train_s": 235.4904489517212,
+        "samples_s": 1062.0142811686194,
+        "accuracy": 0.7640799880027771
+      }
+    }
+  },
+  {
+    "mode": "streaming",
+    "dataset": "tinyimagenet",
+    "max_classes": 50,
+    "run": 0,
+    "seed": 44,
+    "timestamp": "2026-05-14T15:44:43",
+    "results": {
+      "tfrecord": {
+        "convert_s": 0.7206079959869385,
+        "first_batch_s": 0.3244009017944336,
+        "ram_mb": 4.548007011413574,
+        "file_mb": 590.9933376312256,
+        "train_s": 240.3993148803711,
+        "samples_s": 1040.3966052288695,
+        "accuracy": 0.7002800107002258
+      }
+    }
+  }
+]

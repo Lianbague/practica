@@ -272,7 +272,11 @@ def save_tfrecord(ds: Dataset, path: str) -> None:
             )
 
     with open(path + ".meta.json", "w") as f:
-        json.dump({"class_names": ds.class_names, "img_shape": list(ds.img_shape)}, f)
+        json.dump({
+            "class_names": ds.class_names,
+            "img_shape":   list(ds.img_shape),
+            "num_samples": len(ds.X),
+        }, f)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
