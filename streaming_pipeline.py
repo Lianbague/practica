@@ -35,24 +35,22 @@ import numpy as np
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ThroughputCallback — base class resolved at import time to avoid circular TF
+# ThroughputCallback — plain duck-typed class, no module-level TF import.
+# Keras 3 calls callback methods by name (hasattr/getattr); it does not require
+# strict inheritance from keras.callbacks.Callback.  __getattr__ absorbs any
+# protocol methods (set_model, set_params, on_train_begin, …) we don't define.
 # ─────────────────────────────────────────────────────────────────────────────
 
-try:
-    import tensorflow as _tf_eager
-    _KERAS_BASE = _tf_eager.keras.callbacks.Callback
-except Exception:
-    _KERAS_BASE = object
-
-
-class ThroughputCallback(_KERAS_BASE):
+class ThroughputCallback:
     """Records wall-clock time per epoch and computes aggregate throughput."""
 
     def __init__(self) -> None:
-        if _KERAS_BASE is not object:
-            super().__init__()
         self.epoch_times: list[float] = []
         self._t0: float = 0.0
+
+    def __getattr__(self, name: str):
+        # Absorb any Keras callback protocol method not explicitly defined here.
+        return lambda *args, **kwargs: None
 
     def on_epoch_begin(self, epoch: int, logs=None) -> None:
         self._t0 = time.perf_counter()

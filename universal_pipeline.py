@@ -183,38 +183,8 @@ def load_npz(path: str) -> Dataset:
 
 
 def load_tfrecord(path: str) -> Dataset:
-    import tensorflow as tf
-
-    meta_path = path + ".meta.json"
-    class_names: list = []
-    img_shape: tuple  = (0, 0, 3)
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        class_names = meta.get("class_names", [])
-        img_shape   = tuple(meta.get("img_shape", [0, 0, 3]))
-
-    def _parse(proto):
-        feat = {
-            "image":    tf.io.FixedLenFeature([], tf.string),
-            "label":    tf.io.FixedLenFeature([], tf.int64),
-            "height":   tf.io.FixedLenFeature([], tf.int64),
-            "width":    tf.io.FixedLenFeature([], tf.int64),
-            "channels": tf.io.FixedLenFeature([], tf.int64),
-        }
-        ex  = tf.io.parse_single_example(proto, feat)
-        img = tf.io.decode_raw(ex["image"], tf.uint8)
-        img = tf.reshape(img, (ex["height"], ex["width"], ex["channels"]))
-        return img, ex["label"]
-
-    Xs, Ys = [], []
-    for imgs, labels in tf.data.TFRecordDataset(path).map(_parse).batch(512):
-        Xs.append(imgs.numpy())
-        Ys.append(labels.numpy())
-
-    X = np.concatenate(Xs) if Xs else np.empty((0,) + img_shape, dtype=np.uint8)
-    Y = np.concatenate(Ys).astype(np.int32) if Ys else np.array([], dtype=np.int32)
-    return Dataset(X, Y, tuple(X.shape[1:]), class_names)
+    from app.tfrecord_io import load as _tio_load
+    return _tio_load(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -254,29 +224,8 @@ def save_npz(ds: Dataset, path: str) -> None:
 
 
 def save_tfrecord(ds: Dataset, path: str) -> None:
-    import tensorflow as tf
-
-    with tf.io.TFRecordWriter(path) as writer:
-        for img, label in zip(ds.X, ds.Y):
-            h, w, c = img.shape
-            feat = {
-                "image":    tf.train.Feature(bytes_list=tf.train.BytesList(value=[img.tobytes()])),
-                "label":    tf.train.Feature(int64_list=tf.train.Int64List(value=[int(label)])),
-                "height":   tf.train.Feature(int64_list=tf.train.Int64List(value=[h])),
-                "width":    tf.train.Feature(int64_list=tf.train.Int64List(value=[w])),
-                "channels": tf.train.Feature(int64_list=tf.train.Int64List(value=[c])),
-            }
-            writer.write(
-                tf.train.Example(features=tf.train.Features(feature=feat))
-                .SerializeToString()
-            )
-
-    with open(path + ".meta.json", "w") as f:
-        json.dump({
-            "class_names": ds.class_names,
-            "img_shape":   list(ds.img_shape),
-            "num_samples": len(ds.X),
-        }, f)
+    from app.tfrecord_io import save as _tio_save
+    _tio_save(ds, path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

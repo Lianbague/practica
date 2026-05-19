@@ -32,15 +32,36 @@ import random
 import time
 import tracemalloc
 
+# ── macOS ARM64 crash fix ────────────────────────────────────────────────────
+# Installing streamlit (for the dataset-converter app) pulled in pyarrow, which
+# bundles libarrow.2100.dylib.  TF 2.20 probes for pyarrow as an optional
+# dependency; loading libarrow after other C extensions are already initialised
+# causes a protobuf static-initialiser mutex crash on macOS ARM.
+#
+# Fix A – disable TF's pluggable-device subsystem (prevents tf-metal / Arrow).
+# Fix B – stub out pyarrow in sys.modules before TF ever sees it, so the real
+#         C extension is never loaded.  benchmark.py does not use pyarrow at all.
+import sys as _sys, types as _types
+if "pyarrow" not in _sys.modules:
+    _pa = _types.ModuleType("pyarrow")
+    _pa.__version__ = "0.0.0"
+    # Make any attribute access return another stub so TF's probing doesn't
+    # raise AttributeError.
+    _pa.__getattr__ = lambda name: _types.ModuleType(f"pyarrow.{name}")
+    _sys.modules.setdefault("pyarrow", _pa)
+    for _sub in ("pyarrow.lib", "pyarrow.compute", "pyarrow.ipc",
+                 "pyarrow.parquet", "pyarrow.csv", "pyarrow.dataset"):
+        _sys.modules.setdefault(_sub, _types.ModuleType(_sub))
+    del _pa, _sub
+
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ["TF_DISABLE_PLUGGABLE_DEVICE"] = "1"
+
 import numpy as np
 
 from universal_pipeline import load, save, validate, detect_format, ALL_FORMATS, Dataset
 from streaming_pipeline import stream, get_dataset_info, ThroughputCallback
 
-from MNIST_neural_network_training import (
-    gradient_descent, forward_prop, get_predictions, get_accuracy,
-)
-from TINYIMAGENET_model import create_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,6 +197,9 @@ def _run_pipeline(src_train, src_val, src_fmt, out_dir, load_kwargs=None):
 
 def _train_mnist(ds_train: Dataset, ds_val: Dataset,
                  iterations: int = 500, alpha: float = 0.1) -> float:
+    from MNIST_neural_network_training import (
+        gradient_descent, forward_prop, get_predictions, get_accuracy,
+    )
     X_tr = ds_train.X.reshape(ds_train.num_samples, -1).T / 255.0
     X_va = ds_val.X.reshape(ds_val.num_samples, -1).T / 255.0
     perm = np.random.permutation(ds_train.num_samples)
@@ -264,6 +288,7 @@ def run_mnist_benchmark(
 
 def _train_tinyimagenet(ds_train: Dataset, ds_val: Dataset,
                         epochs: int = 10, batch_size: int = 32) -> float:
+    from TINYIMAGENET_model import create_model
     ds_tr = ds_train.normalized()
     ds_va = ds_val.normalized()
     model = create_model(ds_train.num_classes)
@@ -415,6 +440,7 @@ def run_tinyimagenet_streaming_benchmark(
             train_ds = train_ds.repeat()
             val_ds   = val_ds.repeat()
 
+            from TINYIMAGENET_model import create_model
             model         = create_model(ds_train_src.num_classes)
             throughput_cb = ThroughputCallback()
 
