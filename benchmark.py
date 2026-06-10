@@ -1,52 +1,54 @@
 """
 benchmark.py
 ─────────────────────────────────────────────────────────────────────────────
-Measures conversion time, load time, RAM, file size, training time and
-accuracy across all dataset formats for both MNIST and Tiny ImageNet.
+Three-experiment benchmark comparing dataset storage formats.
 
-Data pipeline  : universal_pipeline  (format-agnostic)
-MNIST model    : custom 2-layer NumPy NN  (MNIST_neural_network_training.py)
-TinyImageNet   : Keras CNN               (TINYIMAGENET_model.py)
+  Experiment 1  –  Conversion cost
+                   Full 4×3 conversion matrix (every format → every other).
+                   Measures: conversion time, validation time, file size,
+                   compression ratio.
+
+  Experiment 2  –  Pure loading
+                   No training.  Measures: load time, normalisation time,
+                   total preparation time, read throughput (MB/s), peak RAM.
+
+  Experiment 3  –  Training with a fixed CNN (fullload or streaming)
+                   Measures: first-epoch time, average epoch time (epochs 2-N),
+                   total training time, training throughput (imgs/s),
+                   final validation accuracy and loss.
+                   Streaming also records first-batch latency and peak RAM.
+
+Dataset
+  Tiny ImageNet subsets: --classes 5 | 10 | 25 | 50 | 100
+  Source: tiny-imagenet-200/train/  (imagefolder, one sub-dir per class)
 
 Usage
------
-  # Quick check — all formats, one run:
-  python benchmark.py --mode fullload  --dataset mnist
-  python benchmark.py --mode fullload  --dataset tinyimagenet --max-classes 10
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50
+─────
+  python benchmark.py --experiment 1 --classes 25 --runs 3 --cooldown 60
+  python benchmark.py --experiment 2 --classes 25 --runs 5 --cooldown 30
+  python benchmark.py --experiment 3 --mode fullload  --classes 25 --runs 3 --epochs 10 --cooldown 60
+  python benchmark.py --experiment 3 --mode streaming --classes 25 --runs 3 --epochs 10 --cooldown 60
 
-  # Thermally isolated, reproducible — one format per invocation:
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format imagefolder --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format hdf5        --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format npz         --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format tfrecord    --runs 3
+  --cooldown     N   seconds to wait between format groups (thermal recovery)
+  --cooldown-run N   seconds to wait between individual runs within a format
+  --format       fmt run only this format (omit to run all four)
+  --runs         N   repetitions per format; report mean ± std
 
-  # Aggregate saved results into a summary table:
-  python aggregate_results.py results_streaming_tinyimagenet_50classes.json
+Per-run JSON storage
+  Every completed run is immediately appended as its own record to the results
+  file.  This means you can run formats or individual runs in separate
+  invocations and the file accumulates correctly.  Use aggregate_results.py to
+  compute mean ± std across all collected records.
 """
 
-import json
-import math
-import os
-import random
-import time
-import tracemalloc
+from __future__ import annotations
 
-# ── macOS ARM64 crash fix ────────────────────────────────────────────────────
-# Installing streamlit (for the dataset-converter app) pulled in pyarrow, which
-# bundles libarrow.2100.dylib.  TF 2.20 probes for pyarrow as an optional
-# dependency; loading libarrow after other C extensions are already initialised
-# causes a protobuf static-initialiser mutex crash on macOS ARM.
-#
-# Fix A – disable TF's pluggable-device subsystem (prevents tf-metal / Arrow).
-# Fix B – stub out pyarrow in sys.modules before TF ever sees it, so the real
-#         C extension is never loaded.  benchmark.py does not use pyarrow at all.
-import sys as _sys, types as _types
+# ── macOS ARM64 / pyarrow crash fix (must be before any TF import) ────────────
+import sys as _sys, types as _types, os
+
 if "pyarrow" not in _sys.modules:
     _pa = _types.ModuleType("pyarrow")
     _pa.__version__ = "0.0.0"
-    # Make any attribute access return another stub so TF's probing doesn't
-    # raise AttributeError.
     _pa.__getattr__ = lambda name: _types.ModuleType(f"pyarrow.{name}")
     _sys.modules.setdefault("pyarrow", _pa)
     for _sub in ("pyarrow.lib", "pyarrow.compute", "pyarrow.ipc",
@@ -54,22 +56,69 @@ if "pyarrow" not in _sys.modules:
         _sys.modules.setdefault(_sub, _types.ModuleType(_sub))
     del _pa, _sub
 
-os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ["KERAS_BACKEND"]             = "tensorflow"
 os.environ["TF_DISABLE_PLUGGABLE_DEVICE"] = "1"
 
+# ── stdlib ────────────────────────────────────────────────────────────────────
+import json
+import math
+import random
+import shutil
+import time
+import tracemalloc
+from pathlib import Path
+
+# ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
 
-from universal_pipeline import load, save, validate, detect_format, ALL_FORMATS, Dataset
-from streaming_pipeline import stream, get_dataset_info, ThroughputCallback
+# ── project ───────────────────────────────────────────────────────────────────
+from universal_pipeline import load, save, validate, ALL_FORMATS, Dataset
+from streaming_pipeline  import stream, get_dataset_info
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-epoch timing callback  (duck-typed; works with Keras 3 without inheriting)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EpochTimingCallback:
+    """Records wall-clock time for every epoch during model.fit()."""
+
+    def __init__(self) -> None:
+        self.epoch_times: list[float] = []
+        self._t0: float = 0.0
+
+    def __getattr__(self, name: str):
+        return lambda *a, **kw: None
+
+    def on_epoch_begin(self, epoch: int, logs=None) -> None:
+        self._t0 = time.perf_counter()
+
+    def on_epoch_end(self, epoch: int, logs=None) -> None:
+        self.epoch_times.append(time.perf_counter() - self._t0)
+
+    @property
+    def first_epoch_s(self) -> float:
+        return self.epoch_times[0] if self.epoch_times else 0.0
+
+    @property
+    def avg_epoch_2n_s(self) -> float:
+        if len(self.epoch_times) <= 1:
+            return self.epoch_times[-1] if self.epoch_times else 0.0
+        return float(np.mean(self.epoch_times[1:]))
+
+    def training_throughput(self, num_samples: int, epochs: int) -> float:
+        total = sum(self.epoch_times)
+        return (num_samples * epochs) / total if total > 0 else 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _set_seed(seed: int):
-    """Fix Python, NumPy and TensorFlow random seeds for reproducible training."""
+_EXT = {"imagefolder": "", "hdf5": ".h5", "npz": ".npz", "tfrecord": ".tfrecord"}
+
+
+def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -79,66 +128,75 @@ def _set_seed(seed: int):
         pass
 
 
-def _auto_results_file(mode: str, dataset: str, max_classes: int) -> str:
-    if dataset == "mnist":
-        return f"results_{mode}_mnist.json"
-    return f"results_{mode}_tinyimagenet_{max_classes}classes.json"
+def _cooldown(seconds: int, label: str = "Thermal cooldown") -> None:
+    if seconds <= 0:
+        return
+    print()
+    for remaining in range(seconds, 0, -1):
+        print(f"\r  ⏸  {label} … {remaining:3d}s remaining   ",
+              end="", flush=True)
+        time.sleep(1)
+    print(f"\r  ✓  {label} complete.                         ")
 
 
-def _append_results(filepath: str, mode: str, dataset: str, max_classes: int,
-                    run_idx: int, seed: int, results: dict):
-    entry = {
-        "mode":        mode,
-        "dataset":     dataset,
-        "max_classes": max_classes if dataset != "mnist" else None,
-        "run":         run_idx,
-        "seed":        seed,
-        "timestamp":   time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "results":     results,
-    }
-    existing = []
+def _size_mb(*paths: str) -> float:
+    total = 0
+    for p in paths:
+        pp = Path(p)
+        if pp.is_dir():
+            total += sum(f.stat().st_size for f in pp.rglob("*") if f.is_file())
+        elif pp.exists():
+            total += pp.stat().st_size
+        meta = Path(p + ".meta.json")
+        if meta.exists():
+            total += meta.stat().st_size
+    return total / 1024 ** 2
+
+
+def _dst(out_dir: str, stem: str, fmt: str) -> str:
+    if fmt == "imagefolder":
+        return os.path.join(out_dir, f"{stem}_imagefolder")
+    return os.path.join(out_dir, f"{stem}{_EXT[fmt]}")
+
+
+def _path_exists(path: str) -> bool:
+    return Path(path).exists()
+
+
+def _remove(path: str) -> None:
+    p = Path(path)
+    if p.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    elif p.exists():
+        p.unlink(missing_ok=True)
+    meta = Path(path + ".meta.json")
+    if meta.exists():
+        meta.unlink(missing_ok=True)
+
+
+def _append_to_file(filepath: str, entry: dict) -> None:
+    existing: list = []
     if os.path.exists(filepath):
         with open(filepath) as f:
             existing = json.load(f)
     existing.append(entry)
     with open(filepath, "w") as f:
         json.dump(existing, f, indent=2)
-    print(f"  ✔ Saved → {filepath}  (run {run_idx + 1})")
+    print(f"  ✔ Saved → {filepath}")
 
 
-def _peak_ram_mb(fn, *args, **kwargs):
-    tracemalloc.start()
-    result = fn(*args, **kwargs)
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    return result, peak / 1024 ** 2
+def _section(title: str) -> None:
+    width = max(75, len(title) + 4)
+    print(f"\n{'═' * width}\n  {title}\n{'═' * width}")
 
 
-def _size_mb(*paths: str) -> float:
-    total = 0
-    for p in paths:
-        if os.path.isdir(p):
-            for dp, _, fns in os.walk(p):
-                for f in fns:
-                    total += os.path.getsize(os.path.join(dp, f))
-        elif os.path.exists(p):
-            total += os.path.getsize(p)
-    return total / 1024 ** 2
-
-
-_EXT = {"imagefolder": "", "hdf5": ".h5", "npz": ".npz", "tfrecord": ".tfrecord"}
-
-
-def _dst(out_dir: str, split: str, fmt: str) -> str:
-    if fmt == "imagefolder":
-        return os.path.join(out_dir, f"{split}_imagefolder")
-    return os.path.join(out_dir, f"{split}{_EXT[fmt]}")
-
-
-def _print_table(rows, headers):
-    widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
-    sep    = "─" * (sum(widths) + 2 * len(widths) + 2)
-    line   = "  " + "  ".join(f"{{:<{w}}}" for w in widths)
+def _print_table(rows: list, headers: list) -> None:
+    if not rows:
+        return
+    all_rows = [headers] + rows
+    widths = [max(len(str(r[i])) for r in all_rows) for i in range(len(headers))]
+    sep  = "─" * (sum(widths) + 3 * len(widths) + 1)
+    line = "  " + "  ".join(f"{{:<{w}}}" for w in widths)
     print(sep)
     print(line.format(*headers))
     print(sep)
@@ -147,357 +205,572 @@ def _print_table(rows, headers):
     print(sep)
 
 
-def _section(title):
-    print(f"\n{'═' * 75}\n  {title}\n{'═' * 75}")
+def _stats(values: list[float]) -> tuple[float, float]:
+    return round(float(np.mean(values)), 4), round(float(np.std(values)), 4)
 
 
-def _run_pipeline(src_train, src_val, src_fmt, out_dir, load_kwargs=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset setup  (convert imagefolder → all binary formats once)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _setup_formats(imagefolder_path: str, classes: int, out_dir: str) -> dict:
     """
-    Steps 1-3 shared by all benchmarks:
-      1. Load source dataset
-      2. Convert to every other format
-      3. Validate each conversion
-    Returns (ds_train_src, ds_val_src, convert_times, fmt_paths).
+    Ensure train and val files exist for all binary formats under out_dir.
+    Loads from imagefolder, splits 80/20, converts.  Skips formats already present.
+    Returns {fmt: (train_path, val_path)} for all 4 formats.
+    imagefolder entry points to the original source directory.
     """
-    load_kwargs = load_kwargs or {}
     os.makedirs(out_dir, exist_ok=True)
-    other_fmts = [f for f in ALL_FORMATS if f != src_fmt]
 
-    print(f"\n[1/4] Loading source ({src_fmt})...")
-    ds_train = load(src_train, src_fmt, **load_kwargs)
-    ds_val   = load(src_val,   src_fmt, **load_kwargs)
-    print(f"  Train : {ds_train.num_samples}  |  Val : {ds_val.num_samples}"
-          f"  |  Shape : {ds_train.img_shape}  |  Classes : {ds_train.num_classes}")
+    train_if = os.path.join(out_dir, "train_imagefolder")
+    val_if   = os.path.join(out_dir, "val_imagefolder")
+    fmt_paths: dict = {"imagefolder": (train_if, val_if)}
 
-    print(f"\n[2/4] Converting to all formats...")
-    convert_times = {src_fmt: 0.0}
-    for fmt in other_fmts:
-        t0 = time.time()
-        save(ds_train, _dst(out_dir, "train", fmt), fmt)
-        save(ds_val,   _dst(out_dir, "val",   fmt), fmt)
-        convert_times[fmt] = time.time() - t0
-        print(f"  → {fmt:<13} {convert_times[fmt]:.3f}s")
+    needs = []
+    for fmt in ["imagefolder", "hdf5", "npz", "tfrecord"]:
+        if fmt == "imagefolder":
+            if not (_path_exists(train_if) and _path_exists(val_if)):
+                needs.append("imagefolder")
+        else:
+            t = _dst(out_dir, "train", fmt)
+            v = _dst(out_dir, "val",   fmt)
+            fmt_paths[fmt] = (t, v)
+            if not _path_exists(t):
+                needs.append(fmt)
 
-    print(f"\n[3/4] Validating conversions...")
-    for fmt in other_fmts:
-        print(f"\n  ─── {fmt.upper()} ───")
-        ds_conv = load(_dst(out_dir, "train", fmt), fmt)
-        validate(ds_train, ds_conv, num_samples=20).print_report()
+    if needs:
+        print(f"\n  Setup: loading imagefolder ({classes} classes) …")
+        ds_full = load(imagefolder_path, "imagefolder", max_classes=classes)
 
-    fmt_paths = {src_fmt: (src_train, src_val)}
-    for fmt in other_fmts:
-        fmt_paths[fmt] = (_dst(out_dir, "train", fmt), _dst(out_dir, "val", fmt))
+        n     = ds_full.num_samples
+        split = int(0.8 * n)
+        rng   = np.random.default_rng(seed=0)
+        perm  = rng.permutation(n)
+        ds_tr = Dataset(ds_full.X[perm[:split]], ds_full.Y[perm[:split]],
+                        ds_full.img_shape, ds_full.class_names)
+        ds_va = Dataset(ds_full.X[perm[split:]], ds_full.Y[perm[split:]],
+                        ds_full.img_shape, ds_full.class_names)
+        print(f"  Total {n} samples  →  train {split}  |  val {n - split}")
 
-    return ds_train, ds_val, convert_times, fmt_paths
+        for fmt in needs:
+            if fmt == "imagefolder":
+                print(f"  Converting → imagefolder splits …", end="", flush=True)
+                t0 = time.time()
+                save(ds_tr, train_if, "imagefolder")
+                save(ds_va, val_if,   "imagefolder")
+                print(f"  {time.time() - t0:.1f}s  ({_size_mb(train_if, val_if):.1f} MB)")
+            else:
+                t, v = fmt_paths[fmt]
+                print(f"  Converting → {fmt} …", end="", flush=True)
+                t0 = time.time()
+                save(ds_tr, t, fmt)
+                save(ds_va, v, fmt)
+                print(f"  {time.time() - t0:.1f}s  ({_size_mb(t, v):.1f} MB)")
+    else:
+        print(f"\n  Setup: all formats present in {out_dir}")
+
+    return fmt_paths
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MNIST — custom 2-layer NumPy neural network
+# Experiment 1 — Conversion cost
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _train_mnist(ds_train: Dataset, ds_val: Dataset,
-                 iterations: int = 500, alpha: float = 0.1) -> float:
-    from MNIST_neural_network_training import (
-        gradient_descent, forward_prop, get_predictions, get_accuracy,
-    )
-    X_tr = ds_train.X.reshape(ds_train.num_samples, -1).T / 255.0
-    X_va = ds_val.X.reshape(ds_val.num_samples, -1).T / 255.0
-    perm = np.random.permutation(ds_train.num_samples)
-    X_tr, Y_tr = X_tr[:, perm], ds_train.Y[perm]
-    w1, b1, w2, b2 = gradient_descent(X_tr, Y_tr, iterations, alpha)
-    _, _, _, a2 = forward_prop(w1, b1, w2, b2, X_va)
-    return get_accuracy(get_predictions(a2), ds_val.Y)
+def experiment_1(
+    dataset:      str,
+    classes:      int,
+    fmt_paths:    dict,
+    runs:         int,
+    cooldown:     int,
+    cooldown_run: int,
+    fmt_filter:   str | None,
+    results_file: str,
+) -> None:
+    """
+    Full 4×3 conversion matrix (every format to every other format).
+    Each run is saved immediately as its own JSON record so you can run
+    formats or individual runs in separate invocations.
+    """
+    _section(f"EXPERIMENT 1 — CONVERSION COST  |  {dataset}  |  {classes} classes  |  {runs} runs")
 
+    all_pairs = [(s, d) for s in ALL_FORMATS for d in ALL_FORMATS if s != d]
+    pairs = [(s, d) for s, d in all_pairs
+             if fmt_filter is None or s == fmt_filter or d == fmt_filter]
 
-def run_mnist_benchmark(
-    train_path:   str   = "mnist_imagefolder/train",
-    val_path:     str   = "mnist_imagefolder/test",
-    output_dir:   str   = "bench_mnist",
-    iterations:   int   = 500,
-    alpha:        float = 0.1,
-    fmt_filter:   str   = None,
-    runs:         int   = 1,
-    seed:         int   = 42,
-    results_file: str   = None,
-) -> dict:
-    src_fmt = detect_format(train_path)
-    label   = (f"  |  format: {fmt_filter.upper()}" if fmt_filter else "") + \
-              (f"  |  {runs} run(s)" if runs > 1 else "")
-    _section(f"MNIST BENCHMARK  |  source: {src_fmt.upper()}{label}")
+    tmp_dir = os.path.join(os.path.dirname(fmt_paths["hdf5"][0]), "exp1_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
 
-    ds_train_src, ds_val_src, convert_times, fmt_paths = _run_pipeline(
-        train_path, val_path, src_fmt, output_dir,
-    )
+    src_sizes: dict[str, float] = {fmt: _size_mb(*fmt_paths[fmt]) for fmt in ALL_FORMATS}
 
-    print(f"\n[4/4] Training on each format ({iterations} iterations)...")
-    formats_to_train = [fmt_filter] if fmt_filter else ALL_FORMATS
-    last_results = {}
+    # Accumulate in memory for the end-of-session summary table
+    session_records: dict[str, list] = {}
 
-    for fmt in formats_to_train:
-        t_path, v_path = fmt_paths[fmt]
+    for pair_idx, (src_fmt, dst_fmt) in enumerate(pairs):
+        if pair_idx > 0:
+            _cooldown(cooldown, "Format-group cooldown")
 
-        t0 = time.time()
-        (ds_tr, ram_tr) = _peak_ram_mb(load, t_path, fmt)
-        (ds_va, ram_va) = _peak_ram_mb(load, v_path, fmt)
-        load_s = time.time() - t0
+        key = f"{src_fmt}→{dst_fmt}"
+        session_records[key] = []
 
-        extras  = [t_path + ".meta.json", v_path + ".meta.json"] if fmt == "tfrecord" else []
-        file_mb = _size_mb(t_path, v_path, *extras)
+        src_train, src_val = fmt_paths[src_fmt]
+        load_kw = {"max_classes": classes} if src_fmt == "imagefolder" else {}
+
+        _section(f"  {src_fmt.upper()} → {dst_fmt.upper()}")
+
+        dst_train = _dst(tmp_dir, "train", dst_fmt)
+        dst_val   = _dst(tmp_dir, "val",   dst_fmt)
+        dst_mb    = 0.0
 
         for run_idx in range(runs):
-            run_seed = seed + run_idx
+            if run_idx > 0:
+                _cooldown(cooldown_run, "Run cooldown")
+
+            run_seed = 42 + run_idx
             _set_seed(run_seed)
-            print(f"\n  [{fmt.upper()}]  run {run_idx + 1}/{runs}  seed={run_seed}", end="  ", flush=True)
+            print(f"    run {run_idx + 1}/{runs}  seed={run_seed}", end="  ", flush=True)
 
-            t0      = time.time()
-            acc     = _train_mnist(ds_tr, ds_va, iterations, alpha)
-            train_s = time.time() - t0
+            _remove(dst_train)
+            _remove(dst_val)
 
-            row = {
-                "convert_s": convert_times.get(fmt, 0.0),
-                "load_s":    load_s,
-                "ram_mb":    ram_tr + ram_va,
-                "file_mb":   file_mb,
-                "train_s":   train_s,
-                "accuracy":  acc,
+            # ── conversion time ────────────────────────────────────────────
+            t0 = time.perf_counter()
+            ds_tr = load(src_train, src_fmt, **load_kw)
+            ds_va = load(src_val,   src_fmt, **load_kw)
+            save(ds_tr, dst_train, dst_fmt)
+            save(ds_va, dst_val,   dst_fmt)
+            t_convert = time.perf_counter() - t0
+
+            dst_mb = _size_mb(dst_train, dst_val)
+            compression_ratio = dst_mb / src_sizes[src_fmt] if src_sizes[src_fmt] > 0 else 0.0
+
+            # ── validation time ────────────────────────────────────────────
+            t0 = time.perf_counter()
+            ds_conv = load(dst_train, dst_fmt)
+            validate(ds_tr, ds_conv, num_samples=30)
+            t_validate = time.perf_counter() - t0
+
+            print(f"convert={t_convert:.2f}s  validate={t_validate:.2f}s  "
+                  f"dst={dst_mb:.1f}MB  ratio={compression_ratio:.3f}")
+
+            record = {
+                "experiment":        1,
+                "dataset":           dataset,
+                "classes":           classes,
+                "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "src_fmt":           src_fmt,
+                "dst_fmt":           dst_fmt,
+                "conversion":        key,
+                "run":               run_idx + 1,
+                "seed":              run_seed,
+                "src_file_mb":       round(src_sizes[src_fmt], 3),
+                "dst_file_mb":       round(dst_mb, 3),
+                "compression_ratio": round(compression_ratio, 4),
+                "convert_s":         round(t_convert,  4),
+                "validate_s":        round(t_validate, 4),
             }
-            print(f"load={load_s:.2f}s  train={train_s:.2f}s  acc={acc:.4f}")
-            if results_file:
-                _append_results(results_file, "fullload", "mnist", 0,
-                                run_idx, run_seed, {fmt: row})
-            last_results[fmt] = row
+            session_records[key].append(record)
+            _append_to_file(results_file, record)
 
-    if not fmt_filter:
-        _section("MNIST RESULTS")
-        _print_table(
-            [[fmt + (" *" if fmt == src_fmt else ""),
-              f"{r['convert_s']:.3f}" if r["convert_s"] else "—",
-              f"{r['load_s']:.3f}", f"{r['ram_mb']:.1f}", f"{r['file_mb']:.1f}",
-              f"{r['train_s']:.3f}", f"{r['accuracy']:.4f}"]
-             for fmt, r in ((f, last_results[f]) for f in ALL_FORMATS if f in last_results)],
-            ["Format", "Convert(s)", "Load(s)", "RAM(MB)", "File(MB)", "Train(s)", "Accuracy"],
-        )
-        print("  * source format")
-
-    return last_results
+    # ── summary table (this session only) ────────────────────────────────────
+    _section("EXPERIMENT 1 — SESSION SUMMARY")
+    rows = []
+    for key, recs in session_records.items():
+        cvt = [r["convert_s"]  for r in recs]
+        val = [r["validate_s"] for r in recs]
+        r0  = recs[0]
+        cv_str = (f"{np.mean(cvt):.2f} ± {np.std(cvt):.2f}"
+                  if len(cvt) > 1 else f"{cvt[0]:.2f}")
+        vl_str = (f"{np.mean(val):.2f} ± {np.std(val):.2f}"
+                  if len(val) > 1 else f"{val[0]:.2f}")
+        rows.append([key,
+                     f"{r0['src_file_mb']:.1f}",
+                     f"{r0['dst_file_mb']:.1f}",
+                     f"{r0['compression_ratio']:.3f}",
+                     cv_str, vl_str])
+    _print_table(rows, ["Conversion", "Src MB", "Dst MB", "Ratio",
+                        "Convert (s)", "Validate (s)"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tiny ImageNet — Keras CNN
+# Experiment 2 — Pure loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _train_tinyimagenet(ds_train: Dataset, ds_val: Dataset,
-                        epochs: int = 10, batch_size: int = 32) -> float:
+def experiment_2(
+    dataset:      str,
+    classes:      int,
+    fmt_paths:    dict,
+    runs:         int,
+    cooldown:     int,
+    cooldown_run: int,
+    fmt_filter:   str | None,
+    results_file: str,
+) -> None:
+    """
+    For each format, loads the full dataset from disk N times.
+    Each run is saved immediately as its own JSON record.
+    """
+    _section(f"EXPERIMENT 2 — PURE LOADING  |  {dataset}  |  {classes} classes  |  {runs} runs")
+
+    formats = [f for f in ALL_FORMATS if fmt_filter is None or f == fmt_filter]
+    session_records: dict[str, list] = {}
+
+    for fmt_idx, fmt in enumerate(formats):
+        if fmt_idx > 0:
+            _cooldown(cooldown, "Format-group cooldown")
+
+        t_path, v_path = fmt_paths[fmt]
+        load_kw = {"max_classes": classes} if fmt == "imagefolder" else {}
+        file_mb = _size_mb(t_path, v_path)
+        session_records[fmt] = []
+
+        print(f"\n  [{fmt.upper()}]  on-disk size = {file_mb:.1f} MB")
+
+        for run_idx in range(runs):
+            if run_idx > 0:
+                _cooldown(cooldown_run, "Run cooldown")
+
+            run_seed = 42 + run_idx
+            _set_seed(run_seed)
+            print(f"    run {run_idx + 1}/{runs}  seed={run_seed}", end="  ", flush=True)
+
+            # ── load from disk ─────────────────────────────────────────────
+            tracemalloc.start()
+            t0 = time.perf_counter()
+            ds_tr = load(t_path, fmt, **load_kw)
+            ds_va = load(v_path, fmt, **load_kw)
+            t_load = time.perf_counter() - t0
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            ram_mb = peak_bytes / 1024 ** 2
+
+            # ── normalisation ──────────────────────────────────────────────
+            t0 = time.perf_counter()
+            _ = ds_tr.normalized()
+            _ = ds_va.normalized()
+            t_normalize = time.perf_counter() - t0
+
+            t_total        = t_load + t_normalize
+            throughput_mbs = file_mb / t_load if t_load > 0 else 0.0
+
+            print(f"load={t_load:.3f}s  norm={t_normalize:.3f}s  "
+                  f"total={t_total:.3f}s  {throughput_mbs:.1f} MB/s  RAM={ram_mb:.1f} MB")
+
+            record = {
+                "experiment":     2,
+                "dataset":        dataset,
+                "classes":        classes,
+                "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "fmt":            fmt,
+                "run":            run_idx + 1,
+                "seed":           run_seed,
+                "file_mb":        round(file_mb,       3),
+                "load_s":         round(t_load,        4),
+                "normalize_s":    round(t_normalize,   4),
+                "total_s":        round(t_total,       4),
+                "throughput_mbs": round(throughput_mbs, 3),
+                "ram_mb":         round(ram_mb,         3),
+            }
+            session_records[fmt].append(record)
+            _append_to_file(results_file, record)
+
+    # ── summary table (this session only) ────────────────────────────────────
+    _section("EXPERIMENT 2 — SESSION SUMMARY")
+    rows = []
+    for fmt, recs in session_records.items():
+        def _sv(k):
+            vals = [r[k] for r in recs]
+            return (f"{np.mean(vals):.3f} ± {np.std(vals):.3f}"
+                    if len(vals) > 1 else f"{vals[0]:.3f}")
+        rows.append([fmt, f"{recs[0]['file_mb']:.1f}",
+                     _sv("load_s"), _sv("normalize_s"), _sv("total_s"),
+                     _sv("throughput_mbs"), _sv("ram_mb")])
+    _print_table(rows, ["Format", "MB", "Load(s)", "Norm(s)", "Total(s)", "MB/s", "RAM(MB)"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment 3a — Training, fullload
+# ─────────────────────────────────────────────────────────────────────────────
+
+def experiment_3_fullload(
+    dataset:      str,
+    classes:      int,
+    fmt_paths:    dict,
+    epochs:       int,
+    batch_size:   int,
+    runs:         int,
+    cooldown:     int,
+    cooldown_run: int,
+    fmt_filter:   str | None,
+    results_file: str,
+) -> None:
+    """
+    Loads the full dataset into RAM (once per format), then trains the CNN N times.
+    Splits 80/20 train/val in memory so all formats use identical data.
+    Measures per-epoch timing, total training time, and training throughput.
+    """
     from TINYIMAGENET_model import create_model
-    ds_tr = ds_train.normalized()
-    ds_va = ds_val.normalized()
-    model = create_model(ds_train.num_classes)
-    model.fit(
-        ds_tr.X, ds_tr.Y,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_data=(ds_va.X, ds_va.Y),
-        verbose=1,
-    )
-    _, acc = model.evaluate(ds_va.X, ds_va.Y, verbose=0)
-    return float(acc)
 
+    _section(f"EXPERIMENT 3 (FULLLOAD) — TRAINING  |  {dataset}  |  {classes} classes  "
+             f"|  {epochs} epochs  |  {runs} runs")
 
-def run_tinyimagenet_benchmark(
-    train_path:   str = "tiny-imagenet-200/train",
-    val_path:     str = "tiny-imagenet-200/train",
-    max_classes:  int = 5,
-    output_dir:   str = "bench_tinyimagenet",
-    epochs:       int = 10,
-    batch_size:   int = 32,
-    fmt_filter:   str = None,
-    runs:         int = 1,
-    seed:         int = 42,
-    results_file: str = None,
-) -> dict:
-    src_fmt = detect_format(train_path)
-    label   = (f"  |  format: {fmt_filter.upper()}" if fmt_filter else "") + \
-              (f"  |  {runs} run(s)" if runs > 1 else "")
-    _section(f"TINY IMAGENET BENCHMARK  |  {max_classes} classes  |  source: {src_fmt.upper()}{label}")
+    formats = [f for f in ALL_FORMATS if fmt_filter is None or f == fmt_filter]
+    session_records: dict[str, list] = {}
 
-    load_kw = {"max_classes": max_classes} if src_fmt == "imagefolder" else {}
-    ds_train_src, ds_val_src, convert_times, fmt_paths = _run_pipeline(
-        train_path, val_path, src_fmt, output_dir, load_kw,
-    )
+    for fmt_idx, fmt in enumerate(formats):
+        if fmt_idx > 0:
+            _cooldown(cooldown, "Format-group cooldown")
 
-    print(f"\n[4/4] Training on each format ({epochs} epochs)...")
-    formats_to_train = [fmt_filter] if fmt_filter else ALL_FORMATS
-    last_results = {}
-
-    for fmt in formats_to_train:
         t_path, v_path = fmt_paths[fmt]
-        fmt_load_kw = {"max_classes": max_classes} if fmt == "imagefolder" else {}
+        load_kw = {"max_classes": classes} if fmt == "imagefolder" else {}
 
-        t0 = time.time()
-        (ds_tr, ram_tr) = _peak_ram_mb(load, t_path, fmt, **fmt_load_kw)
-        (ds_va, ram_va) = _peak_ram_mb(load, v_path, fmt, **fmt_load_kw)
-        load_s = time.time() - t0
+        print(f"\n  [{fmt.upper()}]")
 
-        extras  = [t_path + ".meta.json", v_path + ".meta.json"] if fmt == "tfrecord" else []
-        file_mb = _size_mb(t_path, v_path, *extras)
+        # ── load + preprocess train split (timed, reported as single values) ─
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        ds_full = load(t_path, fmt, **load_kw)
+        ds_val_raw = load(v_path, fmt, **load_kw)
+        t_load = time.perf_counter() - t0
+        _, peak_load = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        t0 = time.perf_counter()
+        ds_tr = ds_full.normalized()
+        ds_va = ds_val_raw.normalized()
+        t_preprocess = time.perf_counter() - t0
+
+        num_samples = ds_tr.num_samples
+        num_classes  = ds_tr.num_classes
+        session_records[fmt] = []
+
+        print(f"  t_load={t_load:.3f}s  t_preprocess={t_preprocess:.3f}s  "
+              f"train={num_samples}  val={ds_va.num_samples}  classes={num_classes}")
 
         for run_idx in range(runs):
-            run_seed = seed + run_idx
+            if run_idx > 0:
+                _cooldown(cooldown_run, "Run cooldown")
+
+            run_seed = 42 + run_idx
             _set_seed(run_seed)
-            print(f"\n  [{fmt.upper()}]  run {run_idx + 1}/{runs}  seed={run_seed}")
+            print(f"\n    run {run_idx + 1}/{runs}  seed={run_seed}")
 
-            t0      = time.time()
-            acc     = _train_tinyimagenet(ds_tr, ds_va, epochs, batch_size)
-            train_s = time.time() - t0
+            cb    = EpochTimingCallback()
+            model = create_model(num_classes)
 
-            row = {
-                "convert_s": convert_times.get(fmt, 0.0),
-                "load_s":    load_s,
-                "ram_mb":    ram_tr + ram_va,
-                "file_mb":   file_mb,
-                "train_s":   train_s,
-                "accuracy":  acc,
+            t0 = time.perf_counter()
+            history = model.fit(
+                ds_tr.X, ds_tr.Y,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_data=(ds_va.X, ds_va.Y),
+                callbacks=[cb],
+                verbose=1,
+            )
+            total_train_s = time.perf_counter() - t0
+
+            final_accuracy = float(history.history["val_accuracy"][-1])
+            final_loss     = float(history.history["val_loss"][-1])
+            throughput     = cb.training_throughput(num_samples, epochs)
+
+            print(f"    1st={cb.first_epoch_s:.2f}s  "
+                  f"avg2-N={cb.avg_epoch_2n_s:.2f}s  "
+                  f"total={total_train_s:.2f}s  "
+                  f"{throughput:.0f} imgs/s  "
+                  f"acc={final_accuracy:.4f}")
+
+            record = {
+                "experiment":        3,
+                "mode":              "fullload",
+                "dataset":           dataset,
+                "classes":           classes,
+                "epochs":            epochs,
+                "batch_size":        batch_size,
+                "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "fmt":               fmt,
+                "run":               run_idx + 1,
+                "seed":              run_seed,
+                "num_samples_train": num_samples,
+                "t_load_s":          round(t_load,       4),
+                "t_preprocess_s":    round(t_preprocess, 4),
+                "t_prep_total_s":    round(t_load + t_preprocess, 4),
+                "peak_load_ram_mb":  round(peak_load / 1024 ** 2, 3),
+                "epoch_times":       [round(t, 4) for t in cb.epoch_times],
+                "first_epoch_s":     round(cb.first_epoch_s,  4),
+                "avg_epoch_2n_s":    round(cb.avg_epoch_2n_s, 4),
+                "total_train_s":     round(total_train_s,     4),
+                "training_throughput_imgs_s": round(throughput, 2),
+                "final_accuracy":    round(final_accuracy, 4),
+                "final_loss":        round(final_loss,     4),
             }
-            print(f"  load={load_s:.2f}s  train={train_s:.2f}s  acc={acc:.4f}")
-            if results_file:
-                _append_results(results_file, "fullload", "tinyimagenet", max_classes,
-                                run_idx, run_seed, {fmt: row})
-            last_results[fmt] = row
+            session_records[fmt].append(record)
+            _append_to_file(results_file, record)
 
-    if not fmt_filter:
-        _section(f"TINY IMAGENET RESULTS  ({max_classes} classes)")
-        _print_table(
-            [[fmt + (" *" if fmt == src_fmt else ""),
-              f"{r['convert_s']:.3f}" if r["convert_s"] else "—",
-              f"{r['load_s']:.3f}", f"{r['ram_mb']:.1f}", f"{r['file_mb']:.1f}",
-              f"{r['train_s']:.3f}", f"{r['accuracy']:.4f}"]
-             for fmt, r in ((f, last_results[f]) for f in ALL_FORMATS if f in last_results)],
-            ["Format", "Convert(s)", "Load(s)", "RAM(MB)", "File(MB)", "Train(s)", "Accuracy"],
-        )
-        print("  * source format")
-
-    return last_results
+    # ── summary table (this session only) ────────────────────────────────────
+    _section("EXPERIMENT 3 (FULLLOAD) — SESSION SUMMARY")
+    rows = []
+    for fmt, recs in session_records.items():
+        def _sv(k, fmt_str=".2f"):
+            vals = [r[k] for r in recs]
+            return (f"{np.mean(vals):{fmt_str}} ± {np.std(vals):{fmt_str}}"
+                    if len(vals) > 1 else f"{vals[0]:{fmt_str}}")
+        rows.append([fmt,
+                     f"{recs[0]['t_load_s']:.3f}",
+                     f"{recs[0]['t_preprocess_s']:.3f}",
+                     _sv("first_epoch_s"), _sv("avg_epoch_2n_s"),
+                     _sv("total_train_s"), _sv("training_throughput_imgs_s", ".0f"),
+                     _sv("final_accuracy", ".4f")])
+    _print_table(rows, ["Format", "Load(s)", "Prep(s)", "1stEp(s)", "Avg2-N(s)",
+                        "Total(s)", "imgs/s", "Val Acc"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tiny ImageNet — streaming benchmark  (batch-by-batch, no full RAM load)
+# Experiment 3b — Training, streaming
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_tinyimagenet_streaming_benchmark(
-    train_path:   str = "tiny-imagenet-200/train",
-    val_path:     str = "tiny-imagenet-200/train",
-    max_classes:  int = 5,
-    output_dir:   str = "bench_tinyimagenet",
-    epochs:       int = 10,
-    batch_size:   int = 32,
-    fmt_filter:   str = None,
-    runs:         int = 1,
-    seed:         int = 42,
-    results_file: str = None,
-) -> dict:
-    src_fmt = detect_format(train_path)
-    label   = (f"  |  format: {fmt_filter.upper()}" if fmt_filter else "") + \
-              (f"  |  {runs} run(s)" if runs > 1 else "")
-    _section(
-        f"TINY IMAGENET STREAMING BENCHMARK  |  {max_classes} classes  "
-        f"|  source: {src_fmt.upper()}{label}"
-    )
+def experiment_3_streaming(
+    dataset:      str,
+    classes:      int,
+    fmt_paths:    dict,
+    epochs:       int,
+    batch_size:   int,
+    runs:         int,
+    cooldown:     int,
+    cooldown_run: int,
+    fmt_filter:   str | None,
+    results_file: str,
+) -> None:
+    """
+    Streams data batch-by-batch via tf.data (nothing loaded into RAM upfront).
+    Measures: first-batch latency (cold disk read), per-epoch timing,
+    total training time, training throughput, peak Python-heap RAM.
+    """
+    from TINYIMAGENET_model import create_model
 
-    load_kw = {"max_classes": max_classes} if src_fmt == "imagefolder" else {}
-    ds_train_src, ds_val_src, convert_times, fmt_paths = _run_pipeline(
-        train_path, val_path, src_fmt, output_dir, load_kw,
-    )
+    _section(f"EXPERIMENT 3 (STREAMING) — TRAINING  |  {dataset}  |  {classes} classes  "
+             f"|  {epochs} epochs  |  {runs} runs")
 
-    print(f"\n[4/4] Streaming training on each format ({epochs} epochs)...")
-    formats_to_train = [fmt_filter] if fmt_filter else ALL_FORMATS
-    last_results     = {}
+    # Dataset dimensions from metadata (no full load)
+    t_path_ref, v_path_ref = fmt_paths["imagefolder"]
+    info_tr  = get_dataset_info(t_path_ref, "imagefolder", max_classes=classes)
+    info_val = get_dataset_info(v_path_ref, "imagefolder", max_classes=classes)
+    train_samples    = info_tr.num_samples
+    val_samples      = info_val.num_samples
+    num_classes      = info_tr.num_classes
+    steps_per_epoch  = math.ceil(train_samples / batch_size)
+    validation_steps = math.ceil(val_samples   / batch_size)
+    shuffle_buffer   = train_samples
 
-    steps_per_epoch  = math.ceil(ds_train_src.num_samples / batch_size)
-    validation_steps = math.ceil(ds_val_src.num_samples   / batch_size)
-    shuffle_buffer   = ds_train_src.num_samples
+    print(f"\n  Dataset: {train_samples} train  |  {val_samples} val  "
+          f"|  {steps_per_epoch} steps/epoch  |  {num_classes} classes")
 
-    for fmt in formats_to_train:
+    formats = [f for f in ALL_FORMATS if fmt_filter is None or f == fmt_filter]
+    session_records: dict[str, list] = {}
+
+    for fmt_idx, fmt in enumerate(formats):
+        if fmt_idx > 0:
+            _cooldown(cooldown, "Format-group cooldown")
+
         t_path, v_path = fmt_paths[fmt]
-        stream_kw      = {"max_classes": max_classes} if fmt == "imagefolder" else {}
-        extras         = [t_path + ".meta.json", v_path + ".meta.json"] if fmt == "tfrecord" else []
-        file_mb        = _size_mb(t_path, v_path, *extras)
+        stream_kw = {"max_classes": classes} if fmt == "imagefolder" else {}
+        file_mb   = _size_mb(t_path, v_path)
+        session_records[fmt] = []
+
+        print(f"\n  [{fmt.upper()}]  on-disk size = {file_mb:.1f} MB")
 
         for run_idx in range(runs):
-            run_seed = seed + run_idx
+            if run_idx > 0:
+                _cooldown(cooldown_run, "Run cooldown")
+
+            run_seed = 42 + run_idx
             _set_seed(run_seed)
-            print(f"\n  [{fmt.upper()}]  run {run_idx + 1}/{runs}  seed={run_seed}")
+            print(f"\n    run {run_idx + 1}/{runs}  seed={run_seed}")
 
             train_ds = stream(t_path, fmt, batch_size=batch_size, shuffle=True,
                               shuffle_buffer=shuffle_buffer, **stream_kw)
-            val_ds   = stream(v_path, fmt, batch_size=batch_size, shuffle=False, **stream_kw)
+            val_ds   = stream(v_path, fmt, batch_size=batch_size, shuffle=False,
+                              **stream_kw)
 
-            # First-batch latency: cold read from disk before .repeat()
-            t0 = time.time()
+            # ── first-batch latency (cold read before .repeat()) ──────────
+            t0 = time.perf_counter()
             for _ in train_ds.take(1):
                 pass
-            first_batch_s = time.time() - t0
+            first_batch_s = time.perf_counter() - t0
 
             train_ds = train_ds.repeat()
             val_ds   = val_ds.repeat()
 
-            from TINYIMAGENET_model import create_model
-            model         = create_model(ds_train_src.num_classes)
-            throughput_cb = ThroughputCallback()
+            cb    = EpochTimingCallback()
+            model = create_model(num_classes)
 
             tracemalloc.start()
-            t0 = time.time()
+            t0 = time.perf_counter()
             history = model.fit(
                 train_ds,
                 epochs=epochs,
                 steps_per_epoch=steps_per_epoch,
                 validation_data=val_ds,
                 validation_steps=validation_steps,
-                callbacks=[throughput_cb],
+                callbacks=[cb],
                 verbose=1,
             )
-            train_s = time.time() - t0
+            total_train_s = time.perf_counter() - t0
             _, peak_bytes = tracemalloc.get_traced_memory()
             tracemalloc.stop()
             ram_mb = peak_bytes / 1024 ** 2
 
-            acc       = float(history.history["val_accuracy"][-1])
-            samples_s = throughput_cb.throughput(ds_train_src.num_samples)
+            final_accuracy = float(history.history["val_accuracy"][-1])
+            final_loss     = float(history.history["val_loss"][-1])
+            throughput     = cb.training_throughput(train_samples, epochs)
 
-            row = {
-                "convert_s":     convert_times.get(fmt, 0.0),
-                "first_batch_s": first_batch_s,
-                "ram_mb":        ram_mb,
-                "file_mb":       file_mb,
-                "train_s":       train_s,
-                "samples_s":     samples_s,
-                "accuracy":      acc,
+            print(f"    1st_batch={first_batch_s:.3f}s  "
+                  f"1st_epoch={cb.first_epoch_s:.2f}s  "
+                  f"avg2-N={cb.avg_epoch_2n_s:.2f}s  "
+                  f"total={total_train_s:.2f}s  "
+                  f"{throughput:.0f} imgs/s  "
+                  f"RAM={ram_mb:.1f} MB  "
+                  f"acc={final_accuracy:.4f}")
+
+            record = {
+                "experiment":        3,
+                "mode":              "streaming",
+                "dataset":           dataset,
+                "classes":           classes,
+                "epochs":            epochs,
+                "batch_size":        batch_size,
+                "timestamp":         time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "fmt":               fmt,
+                "run":               run_idx + 1,
+                "seed":              run_seed,
+                "file_mb":           round(file_mb,       3),
+                "num_samples_train": train_samples,
+                "epoch_times":       [round(t, 4) for t in cb.epoch_times],
+                "first_batch_s":     round(first_batch_s,    4),
+                "first_epoch_s":     round(cb.first_epoch_s,  4),
+                "avg_epoch_2n_s":    round(cb.avg_epoch_2n_s, 4),
+                "total_train_s":     round(total_train_s,     4),
+                "training_throughput_imgs_s": round(throughput, 2),
+                "ram_mb":            round(ram_mb,     3),
+                "final_accuracy":    round(final_accuracy, 4),
+                "final_loss":        round(final_loss,     4),
             }
-            print(f"  1st_batch={first_batch_s:.3f}s  train={train_s:.2f}s  "
-                  f"throughput={samples_s:.0f} samples/s  acc={acc:.4f}")
-            if results_file:
-                _append_results(results_file, "streaming", "tinyimagenet", max_classes,
-                                run_idx, run_seed, {fmt: row})
-            last_results[fmt] = row
+            session_records[fmt].append(record)
+            _append_to_file(results_file, record)
 
-    if not fmt_filter:
-        _section(f"TINY IMAGENET STREAMING RESULTS  ({max_classes} classes)")
-        _print_table(
-            [[fmt + (" *" if fmt == src_fmt else ""),
-              f"{r['convert_s']:.3f}" if r["convert_s"] else "—",
-              f"{r['first_batch_s']:.3f}",
-              f"{r['ram_mb']:.1f}",
-              f"{r['file_mb']:.1f}",
-              f"{r['train_s']:.3f}",
-              f"{r['samples_s']:.0f}",
-              f"{r['accuracy']:.4f}"]
-             for fmt, r in ((f, last_results[f]) for f in ALL_FORMATS if f in last_results)],
-            ["Format", "Convert(s)", "1stBatch(s)", "RAM(MB)", "File(MB)",
-             "Train(s)", "Samples/s", "Accuracy"],
-        )
-        print("  * source format")
-        print("  RAM(MB): Python heap peak (tracemalloc) — excludes TensorFlow allocations")
-
-    return last_results
+    # ── summary table (this session only) ────────────────────────────────────
+    _section("EXPERIMENT 3 (STREAMING) — SESSION SUMMARY")
+    rows = []
+    for fmt, recs in session_records.items():
+        def _sv(k, fmt_str=".2f"):
+            vals = [r[k] for r in recs]
+            return (f"{np.mean(vals):{fmt_str}} ± {np.std(vals):{fmt_str}}"
+                    if len(vals) > 1 else f"{vals[0]:{fmt_str}}")
+        rows.append([fmt,
+                     _sv("first_batch_s", ".3f"), _sv("first_epoch_s"),
+                     _sv("avg_epoch_2n_s"), _sv("total_train_s"),
+                     _sv("training_throughput_imgs_s", ".0f"),
+                     _sv("ram_mb", ".1f"), _sv("final_accuracy", ".4f")])
+    _print_table(rows, ["Format", "1stBatch(s)", "1stEp(s)", "Avg2-N(s)",
+                        "Total(s)", "imgs/s", "RAM(MB)", "Val Acc"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -508,67 +781,72 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Format benchmark for MNIST and Tiny ImageNet",
+        description="Dataset format benchmark — 3 experiments",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Quick check — all formats, one run:
-  python benchmark.py --mode fullload  --dataset mnist
-  python benchmark.py --mode fullload  --dataset tinyimagenet --max-classes 10
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50
-
-  # Thermally isolated, reproducible — one format per invocation:
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format imagefolder --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format hdf5        --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format npz         --runs 3
-  python benchmark.py --mode streaming --dataset tinyimagenet --max-classes 50 --format tfrecord    --runs 3
-
-  # Aggregate saved results:
-  python aggregate_results.py results_streaming_tinyimagenet_50classes.json
+  python benchmark.py --experiment 1 --classes 25 --runs 3 --cooldown 60
+  python benchmark.py --experiment 2 --classes 25 --runs 5 --cooldown 30
+  python benchmark.py --experiment 3 --mode fullload  --classes 25 --runs 3 --epochs 10 --cooldown 60
+  python benchmark.py --experiment 3 --mode streaming --classes 25 --runs 3 --epochs 10 --cooldown 60
         """,
     )
-    parser.add_argument(
-        "--mode", required=True, choices=["fullload", "streaming"],
-        help="fullload: load entire dataset into RAM first; streaming: batch-by-batch via tf.data",
-    )
-    parser.add_argument(
-        "--dataset", required=True, choices=["mnist", "tinyimagenet"],
-        help="Which dataset to benchmark",
-    )
-    parser.add_argument(
-        "--format", choices=["imagefolder", "hdf5", "npz", "tfrecord"], default=None,
-        help="Run only this format (omit to run all formats in one go)",
-    )
-    parser.add_argument("--runs",        type=int,   default=1,   help="Repetitions per format (default 1)")
-    parser.add_argument("--seed",        type=int,   default=42,  help="Base random seed; each run uses seed+run_idx")
-    parser.add_argument("--max-classes", type=int,   default=5,   help="Tiny ImageNet: number of classes (default 5)")
-    parser.add_argument("--epochs",      type=int,   default=10,  help="Tiny ImageNet: training epochs")
-    parser.add_argument("--iterations",  type=int,   default=500, help="MNIST: training iterations")
-    parser.add_argument("--alpha",       type=float, default=0.1, help="MNIST: learning rate")
+    parser.add_argument("--experiment",   type=int,  required=True, choices=[1, 2, 3])
+    parser.add_argument("--classes",      type=int,  default=25,
+                        help="Number of Tiny ImageNet classes (5/10/25/50/100)")
+    parser.add_argument("--runs",         type=int,  default=3,
+                        help="Repetitions per format; results reported as mean ± std")
+    parser.add_argument("--epochs",       type=int,  default=10,
+                        help="Training epochs (experiment 3 only)")
+    parser.add_argument("--batch-size",   type=int,  default=32,
+                        help="Batch size (experiment 3 only)")
+    parser.add_argument("--mode",         choices=["fullload", "streaming"], default="fullload",
+                        help="Training mode (experiment 3 only)")
+    parser.add_argument("--cooldown",     type=int,  default=0,
+                        help="Seconds to wait between format groups (thermal recovery)")
+    parser.add_argument("--cooldown-run", type=int,  default=0,
+                        help="Seconds to wait between individual runs within a format")
+    parser.add_argument("--format",       choices=["imagefolder", "hdf5", "npz", "tfrecord"],
+                        default=None,
+                        help="Run only this format (omit to run all four)")
+    parser.add_argument("--src",          default="tiny-imagenet-200/train",
+                        help="Path to the ImageFolder source (default: tiny-imagenet-200/train)")
     args = parser.parse_args()
 
-    if args.mode == "streaming" and args.dataset == "mnist":
-        parser.error("--mode streaming --dataset mnist is not yet implemented")
+    dataset  = "tinyimagenet"
+    out_dir  = f"bench_exp/tinyimagenet_{args.classes}classes"
 
-    results_file = _auto_results_file(args.mode, args.dataset, args.max_classes)
+    # ── result file name ──────────────────────────────────────────────────────
+    if args.experiment == 3:
+        results_file = (f"results_exp3_{args.mode}_"
+                        f"tinyimagenet_{args.classes}classes.json")
+    else:
+        results_file = (f"results_exp{args.experiment}_"
+                        f"tinyimagenet_{args.classes}classes.json")
 
-    if args.mode == "fullload" and args.dataset == "mnist":
-        run_mnist_benchmark(
-            iterations=args.iterations, alpha=args.alpha,
-            fmt_filter=args.format, runs=args.runs, seed=args.seed,
-            results_file=results_file,
-        )
+    # ── setup: ensure all formats exist ──────────────────────────────────────
+    _section(f"SETUP  |  {dataset}  |  {args.classes} classes  →  {out_dir}")
+    fmt_paths = _setup_formats(args.src, args.classes, out_dir)
 
-    elif args.mode == "fullload" and args.dataset == "tinyimagenet":
-        run_tinyimagenet_benchmark(
-            max_classes=args.max_classes, epochs=args.epochs,
-            fmt_filter=args.format, runs=args.runs, seed=args.seed,
-            results_file=results_file,
-        )
+    # ── dispatch ──────────────────────────────────────────────────────────────
+    if args.experiment == 1:
+        experiment_1(dataset, args.classes, fmt_paths,
+                     args.runs, args.cooldown, args.cooldown_run,
+                     args.format, results_file)
 
-    elif args.mode == "streaming" and args.dataset == "tinyimagenet":
-        run_tinyimagenet_streaming_benchmark(
-            max_classes=args.max_classes, epochs=args.epochs,
-            fmt_filter=args.format, runs=args.runs, seed=args.seed,
-            results_file=results_file,
-        )
+    elif args.experiment == 2:
+        experiment_2(dataset, args.classes, fmt_paths,
+                     args.runs, args.cooldown, args.cooldown_run,
+                     args.format, results_file)
+
+    elif args.experiment == 3 and args.mode == "fullload":
+        experiment_3_fullload(dataset, args.classes, fmt_paths,
+                              args.epochs, args.batch_size,
+                              args.runs, args.cooldown, args.cooldown_run,
+                              args.format, results_file)
+
+    elif args.experiment == 3 and args.mode == "streaming":
+        experiment_3_streaming(dataset, args.classes, fmt_paths,
+                               args.epochs, args.batch_size,
+                               args.runs, args.cooldown, args.cooldown_run,
+                               args.format, results_file)
