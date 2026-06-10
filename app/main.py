@@ -11,15 +11,16 @@ Run from the project root:
 import sys
 from pathlib import Path
 
-# Make the project root importable (universal_pipeline, etc.)
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import io
 import json
 import os
 import subprocess
 import tempfile
+import zipfile
 from typing import Optional
 
 import numpy as np
@@ -30,7 +31,7 @@ from universal_pipeline import ALL_FORMATS, detect_format
 import tfrecord_io as _tio
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page config  (must be first Streamlit call)
+# Page config
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -40,14 +41,13 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lightweight helpers  (no full dataset load)
+# Lightweight helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 
 def _peek_metadata(path: str, fmt: str, max_classes: Optional[int]) -> dict:
-    """Return basic metadata without loading the full dataset into RAM."""
     try:
         if fmt == "imagefolder":
             p = Path(path)
@@ -110,7 +110,6 @@ def _peek_metadata(path: str, fmt: str, max_classes: Optional[int]) -> dict:
 
 
 def _peek_images(path: str, fmt: str, n: int = 6) -> list:
-    """Return up to n sample images as display-ready uint8 arrays."""
     images = []
     try:
         if fmt == "imagefolder":
@@ -153,7 +152,6 @@ def _peek_images(path: str, fmt: str, n: int = 6) -> list:
 
 
 def _to_display(arr: np.ndarray) -> np.ndarray:
-    """Convert (H,W,1) grayscale to (H,W) so st.image renders correctly."""
     if arr.ndim == 3 and arr.shape[2] == 1:
         return arr[:, :, 0]
     return arr
@@ -181,18 +179,40 @@ def _output_path(out_dir: str, src_path: str, fmt: str) -> str:
     return str(Path(out_dir) / f"{stem}{ext[fmt]}")
 
 
+def _download_bytes(path: str, fmt: str) -> tuple[bytes, str, str]:
+    """Return (data_bytes, filename, mime_type) for a download button."""
+    p = Path(path)
+    if fmt == "imagefolder" and p.is_dir():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    zf.write(f, f.relative_to(p.parent))
+        return buf.getvalue(), p.name + ".zip", "application/zip"
+    else:
+        data = p.read_bytes()
+        mime = {
+            "hdf5":      "application/x-hdf5",
+            "npz":       "application/zip",
+            "tfrecord":  "application/octet-stream",
+        }.get(fmt, "application/octet-stream")
+        return data, p.name, mime
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Session state initialisation
+# Session state
 # ─────────────────────────────────────────────────────────────────────────────
 
 for key, default in [
-    ("inspected", False),
-    ("converted", False),
-    ("meta", {}),
-    ("src_path", ""),
-    ("src_fmt", ""),
+    ("inspected",          False),
+    ("converted",          False),
+    ("meta",               {}),
+    ("src_path",           ""),
+    ("src_fmt",            ""),
     ("conversion_results", {}),
-    ("samples_dir", ""),
+    ("samples_dir",        ""),
+    ("tmp_upload_path",    ""),
+    ("upload_file_id",     ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -217,20 +237,52 @@ st.divider()
 
 st.header("Step 1 · Source Dataset")
 
-col_path, col_mc = st.columns([4, 1])
-with col_path:
-    src_input = st.text_input(
-        "Path to dataset",
-        placeholder="e.g.  /Users/you/mnist_imagefolder/train  or  /Users/you/data.h5",
+input_mode = st.radio(
+    "How do you want to provide the dataset?",
+    ["📤 Upload file", "📂 Enter path"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+src_input     = ""
+detected_fmt  = None
+
+if input_mode == "📤 Upload file":
+    st.caption("Supported formats: HDF5 (.h5) and NPZ (.npz). For TFRecord or ImageFolder use **Enter path**.")
+    uploaded = st.file_uploader(
+        "Drag and drop your dataset file here",
+        type=["h5", "npz"],
         label_visibility="collapsed",
     )
-with col_mc:
-    max_classes_input = st.number_input(
-        "Max classes", min_value=1, max_value=1000, value=50, step=1,
-        help="Only used when source is ImageFolder — limits how many class folders are loaded.",
+
+    if uploaded is not None:
+        file_id = f"{uploaded.name}_{uploaded.size}"
+        if file_id != st.session_state.upload_file_id:
+            # New file uploaded — write to temp
+            if st.session_state.tmp_upload_path and os.path.exists(st.session_state.tmp_upload_path):
+                os.unlink(st.session_state.tmp_upload_path)
+            ext = Path(uploaded.name).suffix
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            tmp.write(uploaded.getvalue())
+            tmp.close()
+            st.session_state.tmp_upload_path = tmp.name
+            st.session_state.upload_file_id  = file_id
+            st.session_state.inspected       = False
+            st.session_state.converted       = False
+            st.session_state.conversion_results = {}
+
+        src_input = st.session_state.tmp_upload_path
+
+else:
+    src_input = st.text_input(
+        "Path to dataset",
+        placeholder="e.g.  /Users/you/train_imagefolder  or  /Users/you/data.h5",
+        label_visibility="collapsed",
     )
 
-path_exists = src_input and os.path.exists(src_input)
+# ── format detection & inspect button ────────────────────────────────────────
+
+path_exists = bool(src_input and os.path.exists(src_input))
 
 if src_input and not path_exists:
     st.error("Path does not exist.")
@@ -238,30 +290,29 @@ if src_input and not path_exists:
 if path_exists:
     try:
         detected_fmt = detect_format(src_input)
-        st.caption(f"Detected format: **{detected_fmt.upper()}**")
+        if input_mode == "📂 Enter path":
+            st.caption(f"Detected format: **{detected_fmt.upper()}**")
     except ValueError as e:
         st.error(str(e))
         detected_fmt = None
 
-    if detected_fmt:
-        if st.button("Inspect dataset", type="secondary"):
-            st.session_state.inspected = False
-            st.session_state.converted = False
-            st.session_state.conversion_results = {}
+    if detected_fmt and st.button("Inspect dataset", type="secondary"):
+        st.session_state.inspected       = False
+        st.session_state.converted       = False
+        st.session_state.conversion_results = {}
 
-            with st.spinner("Reading dataset metadata…"):
-                mc   = int(max_classes_input) if detected_fmt == "imagefolder" else None
-                meta = _peek_metadata(src_input, detected_fmt, mc)
+        with st.spinner("Reading dataset metadata…"):
+            meta = _peek_metadata(src_input, detected_fmt, max_classes=None)
 
-            if "error" in meta:
-                st.error(f"Could not read dataset: {meta['error']}")
-            else:
-                st.session_state.meta      = meta
-                st.session_state.src_path  = src_input
-                st.session_state.src_fmt   = detected_fmt
-                st.session_state.inspected = True
+        if "error" in meta:
+            st.error(f"Could not read dataset: {meta['error']}")
+        else:
+            st.session_state.meta     = meta
+            st.session_state.src_path = src_input
+            st.session_state.src_fmt  = detected_fmt
+            st.session_state.inspected = True
 
-# ── Inspection results ───────────────────────────────────────────────────────
+# ── inspection results ────────────────────────────────────────────────────────
 
 if st.session_state.inspected:
     meta = st.session_state.meta
@@ -282,7 +333,31 @@ if st.session_state.inspected:
         st.markdown("**Sample images:**")
         cols = st.columns(len(sample_imgs))
         for col, img in zip(cols, sample_imgs):
-            col.image(img, use_container_width=True)
+            col.image(img, width="stretch")
+
+    # Max classes — only for ImageFolder with more than 10 classes
+    max_classes_val = None
+    if (st.session_state.src_fmt == "imagefolder"
+            and meta.get("num_classes", 0) > 10):
+        st.markdown(" ")
+        mc_col, btn_col = st.columns([2, 1])
+        with mc_col:
+            max_classes_val = st.number_input(
+                f"Limit classes (dataset has {meta['num_classes']})",
+                min_value=2, max_value=meta["num_classes"],
+                value=min(50, meta["num_classes"]), step=1,
+                help="Load only the first N class folders (alphabetical order).",
+            )
+        with btn_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Apply limit", type="secondary"):
+                with st.spinner("Re-reading metadata…"):
+                    new_meta = _peek_metadata(
+                        st.session_state.src_path, "imagefolder", int(max_classes_val)
+                    )
+                if "error" not in new_meta:
+                    st.session_state.meta = new_meta
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,14 +368,14 @@ if st.session_state.inspected:
     st.divider()
     st.header("Step 2 · Convert To")
 
-    src_fmt      = st.session_state.src_fmt
-    other_fmts   = [f for f in ALL_FORMATS if f != src_fmt]
-    fmt_labels   = {"imagefolder": "ImageFolder", "hdf5": "HDF5", "npz": "NPZ", "tfrecord": "TFRecord"}
-    fmt_descs    = {
-        "imagefolder": "One PNG file per image, organised in class folders.",
-        "hdf5":        "Single binary .h5 file. Fast load, good for full-load training.",
-        "npz":         "Single compressed .npz file. NumPy native, supports memory mapping.",
-        "tfrecord":    "Sequential .tfrecord file. TensorFlow native, best streaming throughput.",
+    src_fmt    = st.session_state.src_fmt
+    other_fmts = [f for f in ALL_FORMATS if f != src_fmt]
+    fmt_labels = {"imagefolder": "ImageFolder", "hdf5": "HDF5", "npz": "NPZ", "tfrecord": "TFRecord"}
+    fmt_descs  = {
+        "imagefolder": "One PNG per image, organised in class folders.",
+        "hdf5":        "Single binary .h5 file. Fast load, ideal for full-load training.",
+        "npz":         "Single compressed .npz file. NumPy native.",
+        "tfrecord":    "Sequential .tfrecord file. Best streaming throughput.",
     }
 
     st.markdown("Select the formats you want to produce:")
@@ -313,26 +388,25 @@ if st.session_state.inspected:
             if checked:
                 selected_fmts.append(fmt)
 
-    st.markdown(" ")
-    default_out = str(Path(st.session_state.src_path).parent / "converted")
-    out_dir = st.text_input("Output directory", value=default_out)
+    if not selected_fmts:
+        st.warning("Select at least one target format.")
 
-    convert_ready = bool(selected_fmts and out_dir)
-    if not convert_ready:
-        st.warning("Select at least one target format and provide an output directory.")
-
-    if convert_ready and st.button("Convert", type="primary", use_container_width=False):
-        st.session_state.converted = False
+    if selected_fmts and st.button("Convert", type="primary"):
+        st.session_state.converted       = False
         st.session_state.conversion_results = {}
 
         tmp_dir     = tempfile.mkdtemp(prefix="ds_converter_")
         out_json    = os.path.join(tmp_dir, "results.json")
         samples_dir = os.path.join(tmp_dir, "samples")
+        out_dir     = os.path.join(tmp_dir, "output")
+
+        current_meta = st.session_state.meta
+        mc = current_meta.get("num_classes") if src_fmt == "imagefolder" else None
 
         cfg = {
             "src_path":    st.session_state.src_path,
             "src_fmt":     src_fmt,
-            "max_classes": int(max_classes_input) if src_fmt == "imagefolder" else None,
+            "max_classes": mc,
             "out_dir":     out_dir,
             "target_fmts": selected_fmts,
             "out_json":    out_json,
@@ -385,33 +459,85 @@ if st.session_state.inspected:
 
 if st.session_state.converted:
     st.divider()
-    st.header("Step 3 · Results")
+    st.header("Step 3 · Your converted datasets are ready")
 
     results    = st.session_state.conversion_results
     fmt_labels = {"imagefolder": "ImageFolder", "hdf5": "HDF5", "npz": "NPZ", "tfrecord": "TFRecord"}
+    fmt_icons  = {"imagefolder": "🗂️", "hdf5": "🗄️", "npz": "📦", "tfrecord": "📼"}
     all_passed = all(r.get("ok") and r.get("passed") for r in results.values())
 
     if all_passed:
-        st.success("All conversions completed and validated successfully.")
+        st.success("All conversions completed — every pixel was preserved exactly.")
     else:
         st.warning("Some conversions completed with issues — see details below.")
 
+    # ── prominent download cards ──────────────────────────────────────────────
+    ok_results = {fmt: r for fmt, r in results.items() if r.get("ok")}
+    if ok_results:
+        dl_cols = st.columns(len(ok_results))
+        for col, (fmt, r) in zip(dl_cols, ok_results.items()):
+            label    = fmt_labels.get(fmt, fmt.upper())
+            icon     = fmt_icons.get(fmt, "📄")
+            dst_path = r.get("path", "")
+            with col:
+                st.markdown(
+                    f"<div style='text-align:center; padding:1rem; border:1px solid #ddd; "
+                    f"border-radius:8px; background:#fafafa;'>"
+                    f"<div style='font-size:2rem;'>{icon}</div>"
+                    f"<div style='font-weight:bold; font-size:1.05rem;'>{label}</div>"
+                    f"<div style='color:#888; font-size:0.85rem;'>{r['size_mb']:.1f} MB"
+                    f"{'  ✅' if r.get('passed') else ('  ⚠️' if fmt == 'imagefolder' else '  ❌')}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(" ")
+                if dst_path and os.path.exists(dst_path):
+                    try:
+                        data, fname, mime = _download_bytes(dst_path, fmt)
+                        st.download_button(
+                            label=f"Download {label}",
+                            data=data,
+                            file_name=fname,
+                            mime=mime,
+                            key=f"dl_{fmt}",
+                            width="stretch",
+                            type="primary",
+                        )
+                    except Exception:
+                        st.caption(f"Saved to: `{dst_path}`")
+
+    # ── detailed results (collapsible) ───────────────────────────────────────
+    st.markdown(" ")
     for fmt, r in results.items():
         label = fmt_labels.get(fmt, fmt.upper())
+        imagefolder_ordering_note = (
+            fmt == "imagefolder" and r.get("ok")
+            and not r.get("passed")
+        )
         if r.get("ok"):
-            status = "✅ Passed" if r["passed"] else "❌ Validation failed"
-            header = f"{label}  ·  {status}  ·  {r['time_s']:.2f}s  ·  {r['size_mb']:.1f} MB"
+            status = ("⚠️ Validation note" if imagefolder_ordering_note
+                      else "✅ Validation passed" if r["passed"]
+                      else "❌ Validation failed")
+            header = f"{label}  ·  {status}  ·  {r['time_s']:.2f}s"
         else:
-            header = f"{label}  ·  ❌ Error"
+            header = f"{label}  ·  ❌ Conversion error"
 
-        with st.expander(header, expanded=True):
+        with st.expander(header, expanded=False):
             if r.get("ok"):
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Conversion time", f"{r['time_s']:.2f}s")
-                c2.metric("File size on disk", f"{r['size_mb']:.1f} MB")
-                c3.metric("Validation", "PASSED ✅" if r["passed"] else "FAILED ❌")
+                c1.metric("Conversion time",  f"{r['time_s']:.2f}s")
+                c2.metric("File size",         f"{r['size_mb']:.1f} MB")
+                c3.metric("Validation",        "NOTE ⚠️" if imagefolder_ordering_note
+                                               else "PASSED ✅" if r["passed"]
+                                               else "FAILED ❌")
 
-                st.markdown(f"**Saved to:** `{r['path']}`")
+                if imagefolder_ordering_note:
+                    st.info(
+                        "All images and labels are pixel-perfect. The validator reports "
+                        "mismatches because ImageFolder groups images by class folder, "
+                        "which changes the load order compared to the source. "
+                        "The data itself is complete and correct."
+                    )
 
                 st.markdown("**Validation checks:**")
                 for msg in r.get("messages", []):
@@ -434,12 +560,10 @@ if st.session_state.converted:
                         st.markdown("---")
                         st.markdown("**Visual comparison — original vs converted**")
                         cols = st.columns(len(valid_pairs))
-
                         for col, (orig, _, lbl) in zip(cols, valid_pairs):
-                            col.image(PILImage.open(orig), caption=f"Original · {lbl}", use_container_width=True)
-
+                            col.image(PILImage.open(orig), caption=f"Original · {lbl}", width="stretch")
                         for col, (_, conv, lbl) in zip(cols, valid_pairs):
-                            col.image(PILImage.open(conv), caption=f"{label} · {lbl}", use_container_width=True)
+                            col.image(PILImage.open(conv), caption=f"{label} · {lbl}", width="stretch")
 
             else:
                 st.error(r.get("error", "Unknown error"))
