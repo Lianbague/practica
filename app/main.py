@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -170,6 +171,40 @@ def _file_size_mb(path: str) -> float:
     return total / 1024 ** 2
 
 
+def _extract_zip_dataset(zip_bytes: bytes) -> tuple[str, str]:
+    """Extract a ZIP upload and locate the dataset inside.
+    Returns (dataset_path, detected_fmt).
+    - TFRecord ZIP: zip contains train.tfrecord [+ .meta.json]
+    - ImageFolder ZIP: zip contains class subdirectories with images
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="ds_zip_")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        zf.extractall(tmp_dir)
+
+    tmp = Path(tmp_dir)
+
+    # TFRecord: find any .tfrecord file
+    tfrecords = sorted(tmp.rglob("*.tfrecord"))
+    if tfrecords:
+        return str(tfrecords[0]), "tfrecord"
+
+    # ImageFolder: find the shallowest directory whose children are
+    # class subdirectories containing image files
+    for dirpath in sorted(tmp.rglob("*"), key=lambda p: len(p.parts)):
+        if not dirpath.is_dir():
+            continue
+        subdirs = [d for d in dirpath.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if not subdirs:
+            continue
+        if any(
+            any(f.suffix.lower() in _IMG_EXTS for f in d.rglob("*") if f.is_file())
+            for d in subdirs
+        ):
+            return str(dirpath), "imagefolder"
+
+    return tmp_dir, ""
+
+
 def _output_path(out_dir: str, src_path: str, fmt: str) -> str:
     ext = {"hdf5": ".h5", "npz": ".npz", "tfrecord": ".tfrecord", "imagefolder": ""}
     src = Path(src_path)
@@ -212,6 +247,7 @@ for key, default in [
     ("conversion_results", {}),
     ("samples_dir",        ""),
     ("tmp_upload_path",    ""),
+    ("tmp_zip_dir",        ""),
     ("upload_file_id",     ""),
 ]:
     if key not in st.session_state:
@@ -248,27 +284,46 @@ src_input     = ""
 detected_fmt  = None
 
 if input_mode == "📤 Upload file":
-    st.caption("Supported formats: HDF5 (.h5) and NPZ (.npz). For TFRecord or ImageFolder use **Enter path**.")
+    st.caption(
+        "HDF5 (.h5) and NPZ (.npz) — upload directly.  "
+        "TFRecord and ImageFolder — upload as a ZIP file."
+    )
     uploaded = st.file_uploader(
         "Drag and drop your dataset file here",
-        type=["h5", "npz"],
+        type=["h5", "npz", "zip"],
         label_visibility="collapsed",
     )
 
     if uploaded is not None:
         file_id = f"{uploaded.name}_{uploaded.size}"
         if file_id != st.session_state.upload_file_id:
-            # New file uploaded — write to temp
-            if st.session_state.tmp_upload_path and os.path.exists(st.session_state.tmp_upload_path):
-                os.unlink(st.session_state.tmp_upload_path)
-            ext = Path(uploaded.name).suffix
-            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-            tmp.write(uploaded.getvalue())
-            tmp.close()
-            st.session_state.tmp_upload_path = tmp.name
-            st.session_state.upload_file_id  = file_id
-            st.session_state.inspected       = False
-            st.session_state.converted       = False
+            # Clean up previous temp files/dirs
+            prev_path = st.session_state.tmp_upload_path
+            if prev_path and os.path.exists(prev_path):
+                if Path(prev_path).is_file():
+                    os.unlink(prev_path)
+            prev_zip = st.session_state.tmp_zip_dir
+            if prev_zip and os.path.exists(prev_zip):
+                shutil.rmtree(prev_zip, ignore_errors=True)
+            st.session_state.tmp_zip_dir = ""
+
+            if uploaded.name.endswith(".zip"):
+                extracted_path, _zip_fmt = _extract_zip_dataset(uploaded.getvalue())
+                st.session_state.tmp_upload_path = extracted_path
+                # Store root tmp dir for cleanup on next upload
+                st.session_state.tmp_zip_dir = str(Path(extracted_path).parent
+                                                    if Path(extracted_path).is_file()
+                                                    else Path(extracted_path).parent)
+            else:
+                ext = Path(uploaded.name).suffix
+                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+                tmp.write(uploaded.getvalue())
+                tmp.close()
+                st.session_state.tmp_upload_path = tmp.name
+
+            st.session_state.upload_file_id     = file_id
+            st.session_state.inspected          = False
+            st.session_state.converted          = False
             st.session_state.conversion_results = {}
 
         src_input = st.session_state.tmp_upload_path
