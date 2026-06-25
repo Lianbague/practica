@@ -274,7 +274,6 @@ if input_mode == "📤 Upload file":
         src_input = st.session_state.tmp_upload_path
 
 else:
-    st.caption("⚠️ Path mode only works when running the app locally. Use **Upload file** if you are accessing this app via a URL.")
     src_input = st.text_input(
         "Path to dataset",
         placeholder="e.g.  /Users/you/train_imagefolder  or  /Users/you/data.h5",
