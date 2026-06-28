@@ -508,7 +508,10 @@ def experiment_3_fullload(
     Splits 80/20 train/val in memory so all formats use identical data.
     Measures per-epoch timing, total training time, and training throughput.
     """
-    from TINYIMAGENET_model import create_model
+    if dataset == "fashionmnist":
+        from FASHIONMNIST_model import create_model
+    else:
+        from TINYIMAGENET_model import create_model
 
     _section(f"EXPERIMENT 3 (FULLLOAD) — TRAINING  |  {dataset}  |  {classes} classes  "
              f"|  {epochs} epochs  |  {runs} runs")
@@ -644,7 +647,10 @@ def experiment_3_streaming(
     Measures: first-batch latency (cold disk read), per-epoch timing,
     total training time, training throughput, peak Python-heap RAM.
     """
-    from TINYIMAGENET_model import create_model
+    if dataset == "fashionmnist":
+        from FASHIONMNIST_model import create_model
+    else:
+        from TINYIMAGENET_model import create_model
 
     _section(f"EXPERIMENT 3 (STREAMING) — TRAINING  |  {dataset}  |  {classes} classes  "
              f"|  {epochs} epochs  |  {runs} runs")
@@ -809,24 +815,37 @@ Examples:
     parser.add_argument("--format",       choices=["imagefolder", "hdf5", "npz", "tfrecord"],
                         default=None,
                         help="Run only this format (omit to run all four)")
-    parser.add_argument("--src",          default="tiny-imagenet-200/train",
-                        help="Path to the ImageFolder source (default: tiny-imagenet-200/train)")
+    parser.add_argument("--dataset",      choices=["tinyimagenet", "fashionmnist", "cifar10"],
+                        default="tinyimagenet",
+                        help="Dataset to benchmark (default: tinyimagenet)")
+    parser.add_argument("--src",          default=None,
+                        help="Path to the ImageFolder source (auto-detected if not provided)")
     args = parser.parse_args()
 
-    dataset  = "tinyimagenet"
-    out_dir  = f"bench_exp/tinyimagenet_{args.classes}classes"
+    if args.dataset == "tinyimagenet":
+        dataset      = "tinyimagenet"
+        out_dir      = f"bench_exp/tinyimagenet_{args.classes}classes"
+        src          = args.src or "tiny-imagenet-200/train"
+    elif args.dataset == "fashionmnist":
+        dataset      = "fashionmnist"
+        out_dir      = "bench_exp/fashionmnist"
+        src          = args.src or "bench_exp/fashionmnist/train_imagefolder"
+        args.classes = 10
+    elif args.dataset == "cifar10":
+        dataset      = "cifar10"
+        out_dir      = "bench_exp/cifar10"
+        src          = args.src or "bench_exp/cifar10/train_imagefolder"
+        args.classes = 10
 
     # ── result file name ──────────────────────────────────────────────────────
     if args.experiment == 3:
-        results_file = (f"results_exp3_{args.mode}_"
-                        f"tinyimagenet_{args.classes}classes.json")
+        results_file = f"results_exp3_{args.mode}_{dataset}_{args.classes}classes.json"
     else:
-        results_file = (f"results_exp{args.experiment}_"
-                        f"tinyimagenet_{args.classes}classes.json")
+        results_file = f"results_exp{args.experiment}_{dataset}_{args.classes}classes.json"
 
     # ── setup: ensure all formats exist ──────────────────────────────────────
     _section(f"SETUP  |  {dataset}  |  {args.classes} classes  →  {out_dir}")
-    fmt_paths = _setup_formats(args.src, args.classes, out_dir)
+    fmt_paths = _setup_formats(src, args.classes, out_dir)
 
     # ── dispatch ──────────────────────────────────────────────────────────────
     if args.experiment == 1:

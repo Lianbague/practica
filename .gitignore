@@ -11,3 +11,22 @@ __pycache__/
 
 tiny-imagenet-200.zip
 data/
+
+# Benchmark output directories
+bench_exp/
+bench_mnist/
+bench_output/
+bench_tinyimagenet/
+results_model_v2/
+format_inspection/
+figures/
+
+# Result JSON files
+results_*.json
+streaming_*.json
+V1results_*.json
+v1results_*.json
+
+# Documents
+*.docx
+*.pdf

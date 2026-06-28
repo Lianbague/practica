@@ -3,7 +3,7 @@ from tensorflow.keras import layers, models
 
 def create_model(num_classes):
     model = models.Sequential([
-        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(64, 64, 3)),
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),
         layers.MaxPooling2D((2, 2)),
 
         layers.Conv2D(64, (3, 3), activation='relu'),
